@@ -1,0 +1,115 @@
+--Main Query for Chargeback
+
+select week_payment,
+       week_cbk,
+       payment_method,
+       card_provider,
+       domestic,
+       new_customer,
+       reason,
+       ravelin_source,
+       ravelin_score,
+       ravelin_action,
+       market_country,
+       SUM(number_customers)   as number_customers,
+       SUM(number_chargebacks) as number_chargebacks,
+       SUM(cb_eur)             as cb_eur,
+       SUM(gtv)                as gtv,
+       SUM(cb_eur / gtv) * 100 as cb_rate
+from (select date(date_trunc('week', o.creation_time))      as week_payment,
+             coalesce(SUM(gtv / exchange_rate_currency), 0) as gtv
+      from orders o
+      where 1 = 1
+        and o.creation_time >>= current_date - 360
+        and o.final_status in ('CanceledStatus', 'DeliveredStatus')
+      group by 1) a
+         join (select date(date_trunc('week', created_at))                               as week_cbk,
+                      market_country,
+                      o.ordering_payment_method                                          as payment_method,
+                      json_extract_path_text(features, 'payment_method', 'cardProvider') as card_provider,
+                      CASE
+                          WHEN json_extract_path_text(features, 'payment_method', 'marketCountry') =
+                               coalesce(nullif(json_extract_path_text(features, 'payment_method', 'country'), ' '),
+                                        json_extract_path_text(features, 'payment_method', 'marketCountry'))
+                              THEN 'domestic'
+                          ELSE 'non_domestic' END                                        as domestic,
+                      CASE
+                          WHEN date(date_trunc('week', CAST(DATEADD(SECOND, nullif(
+                                                                                    json_extract_path_text(features, 'customer', 'creationTime'),
+                                                                                    ' ')::bigint / 1000
+                              , '1970/1/1') AS DATE))) = date(date_trunc('week', invoice_created_at))
+                              THEN True
+                          ELSE False END                                                 as new_customer,
+                      fpce.reason,
+                      json_extract_path_text(features, 'ravelin', 'source')              as ravelin_source,
+                      json_extract_path_text(features, 'ravelin', 'score')               as ravelin_score,
+                      json_extract_path_text(features, 'ravelin', 'action')              as ravelin_action,
+                      count(distinct o.customer_id)                                      as number_customers,
+                      count(fpce.id)                                                     as number_chargebacks,
+                      sum(-amount_eur)                                                   as cb_eur
+               from fraud_po_chargeback_events fpce
+                        join orders o on fpce.order_id = o.id
+                        left join checkout_order co on co.order_id = o.id
+                        left join risk_feature_snapshots rfs
+                                  on json_extract_path_text(features, 'order', 'checkoutId') =
+                                     cast(co.checkout_id as text)
+               where 1 = 1
+                 and type = 'transaction.chargeback.created'
+                 and o.ordering_payment_method in ('CREDIT_CARD', 'GOOGLE_PAY', 'APPLE_PAY')
+                 and created_at >>= current_date - 360
+               group by 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) b
+              on a.week_payment = b.week_cbk
+group by 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+
+
+
+-- Chargeback arrival curve
+
+SELECT cb_data.*,
+       SUM(cb_data.cb_amount)
+       over (partition by cb_data.cohort
+           order by cb_data.diff_date rows between unbounded preceding and current row) as cb_amount_cumul,
+       SUM(cb_data.cb_amount)
+       over (partition by cb_data.cohort)                                               as cb_amount_total,
+       data.gtv_sum,
+       SUM(cb_data.cb_amount)
+       over (partition by cb_data.cohort
+           order by cb_data.diff_date rows between unbounded preceding and current row) /
+       SUM(cb_data.cb_amount)
+       over (partition by cb_data.cohort)                                               as survival_rate,
+       SUM(cb_data.cb_amount)
+       over (partition by cb_data.cohort
+           order by cb_data.diff_date rows between unbounded preceding and current row) /
+       data.gtv_sum                                                                     as cb_rate
+FROM (SELECT date(date_trunc('week', fpce.invoice_created_at))             as cohort,
+             EXTRACT(DAY FROM (fpce.created_at - fpce.invoice_created_at)) as diff_date,
+             SUM(fpce.amount_eur)                                          as cb_amount
+      FROM fraud_po_chargeback_events fpce
+               join (select id, ordering_payment_method from orders where creation_time >>= '2022-01-01') o
+                    on fpce.order_id = o.id
+      WHERE True
+        and fpce.type = 'transaction.chargeback.created'
+        AND fpce.invoice_created_at >>= '2022-01-01'
+        and o.ordering_payment_method in ('CREDIT_CARD', 'GOOGLE_PAY', 'APPLE_PAY')
+      GROUP BY 1, 2) as cb_data
+
+         INNER JOIN (SELECT date_trunc('week', o.creation_time)   as cohort,
+                            sum(o.gtv / o.exchange_rate_currency) as gtv_sum
+                     FROM orders o
+                     WHERE 1 = 1
+                       and o.creation_time >>= '2022-01-01'
+                       and o.final_status in ('CanceledStatus', 'DeliveredStatus')
+                     GROUP BY 1) AS data ON cb_data.cohort = data.cohort
+                     
+                     
+-- Country total chargeback
+
+select date(date_trunc('week', o.creation_time))      as week_payment,
+       country_code,
+       count(o.id)                                    as number_orders,
+       coalesce(SUM(gtv / exchange_rate_currency), 0) as gtv_country
+from orders o
+where 1 = 1
+  and o.creation_time >>= current_date - 360
+  and o.final_status in ('CanceledStatus', 'DeliveredStatus')
+group by 1, 2
