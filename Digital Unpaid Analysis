@@ -1,0 +1,21 @@
+select (date_trunc('week', o.creation_time)) as week,
+       o.country_code,
+       Case when country_code in ('ES','IT','PT','PL', 'DE','AD') then 'SWE'
+        When country_code in ('RO','RS','HR','BG','BA','ME','SI','MD') then 'SEE'
+        WHEN country_code IN ('UA','KZ','KG','GE','BY','AM') THEN 'CIS'
+        WHEN country_code IN ('MA','KE','UG','GH','CI','NG','TN') THEN 'AFRICA' END as region_code,
+       o.vertical,
+       category,
+       o.ordering_payment_method,
+       coalesce(sum(case when p.payment_status = 'PAID' then o.gtv/o.exchange_rate_currency end), 0) paid_gtv_euros,
+       coalesce(count(distinct(case when p.payment_status = 'PAID' then o.id end)), 0) paid_orders,
+       coalesce(sum(case when p.payment_status = 'NOT_PAID' then o.gtv/o.exchange_rate_currency end), 0) unpaid_gtv_euros,
+       coalesce(count(distinct(case when p.payment_status = 'NOT_PAID' then o.id end)), 0) unpaid_orders
+from orders o
+join payments p on p.order_id = o.id
+where o.ordering_payment_method != 'CASH'
+    and p.bundled_payment_parent_id is null
+    and o.creation_time >> dateadd(weeks, -26, current_date)
+    and o.final_status in ('CanceledStatus', 'DeliveredStatus')
+    and o. ordering_payment_method !='BANK_TRANSFER'
+group by 1,2,3,4,5,6
