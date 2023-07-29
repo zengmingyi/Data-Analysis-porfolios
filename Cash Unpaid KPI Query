@@ -1,0 +1,142 @@
+with total as(
+SELECT 
+    date_trunc('day', o.p_creation_date) as creation_day,
+    o.order_country_code as country,
+    CASE WHEN o.order_is_first_created_order = True THEN 'NC' ELSE 'EC' END as customer_type,
+    SUM(CASE WHEN p.payment_status in ('PAID', 'NOT_PAID') THEN o.order_total_purchase_eur end) as total_GMV_eur,
+    SUM(CASE WHEN p.payment_status in ('PAID', 'NOT_PAID') THEN o.order_transacted_value_eur end) as total_GTV_eur,
+    COUNT(DISTINCT o.order_id) as count_total_orders,
+    COUNT(DISTINCT o.customer_id) as customer_count
+
+FROM 
+    "delta"."fintech_payments_odp"."payments" p
+
+INNER JOIN "delta"."central_order_descriptors_odp"."order_descriptors_v2"  o on o.order_id = p.order_id
+
+WHERE 
+    o.p_creation_date > current_date  - interval '180' day 
+    AND o.order_transacted_value_eur > 0 
+
+GROUP BY 1,2,3
+ORDER BY 1 DESC
+),
+
+cash as (
+SELECT
+    date_trunc('day', o.p_creation_date) as creation_day,
+    o.order_country_code as country,    
+    CASE WHEN o.order_is_first_created_order = True THEN 'NC' ELSE 'EC' end as customer_type,
+    COUNT(DISTINCT o.order_id) as count_cash_orders,
+    SUM(o.order_transacted_value_eur) as total_GTV_cash_eur,
+    -- unpaid cash metrics
+    COUNT(DISTINCT CASE WHEN p.payment_status = 'NOT_PAID' THEN o.order_id ELSE 0 END) as count_unpaid_cash_orders,
+    SUM(CASE WHEN p.payment_status = 'NOT_PAID' THEN o.order_total_purchase_eur END) as total_GMV_cash_unpaid_eur,
+    COUNT(DISTINCT CASE WHEN p.payment_status = 'NOT_PAID' THEN o.order_id end)*100/cast(COUNT(distinct o.order_id) as real) as cash_unpaid_rate,
+    SUM(CASE WHEN p.payment_status = 'NOT_PAID' THEN o.order_transacted_value_eur END) as total_GTV_cash_unpaid_eur,
+    AVG(CASE WHEN p.payment_status = 'NOT_PAID' THEN o.order_transacted_value_eur END) as avg_GTV_cash_unpaid_eur,
+    AVG(CASE WHEN p.payment_status = 'PAID' THEN o.order_transacted_value_eur end) as avg_GTV_cash_paid_eur,
+
+    -- Cancellation reasons
+    COUNT(DISTINCT CASE WHEN o.order_cancel_reason = 'CUSTOMER_ABSENT' THEN o.order_id END) as cash_customer_absence,
+    COUNT(DISTINCT CASE WHEN o.order_final_status = 'CanceledStatus' THEN o.order_id end) as cancelled_cash_orders,
+    AVG(CASE WHEN o.order_final_status = 'CanceledStatus' THEN o.order_transacted_value_eur end) as avg_cancelled_value_eur,
+
+    -- PAID cash orders 
+    COUNT(DISTINCT CASE WHEN p.payment_status = 'PAID' THEN o.order_id END) as count_paid_cash_orders,
+
+    COUNT(DISTINCT o.customer_id) as customer_count
+
+
+FROM 
+    "delta"."fintech_payments_odp"."payments" p
+
+INNER JOIN "delta"."central_order_descriptors_odp"."order_descriptors_v2"  o on o.order_id = p.order_id
+
+WHERE 
+    o.p_creation_date > current_date  - interval '180' day 
+    AND p.payment_method = 'CASH' and o.order_transacted_value_eur > 0 
+    AND p.bundled_payment_parent_id is null -- to avoid computing debt twice
+
+GROUP BY 1,2,3
+ORDER BY 1 DESC),
+
+
+rule_triggers as (
+
+        SELECT  date_trunc('day', rfs.p_creation_date) as creation_day,
+                order_country as country,
+                CASE WHEN customer_finished_orders_count = 0 THEN 'NC' ELSE 'EC' END as customer_type,
+                AVG(CASE WHEN rd.rule = 'ml_cash_unpaid' THEN ml_uch_score ELSE null END) as avg_ml_score,
+                COUNT(DISTINCT case when rd.rule = 'ml_cash_unpaid' then rd.decision_id else null end) as ml_cash_unpaid_rule_hits,
+                COUNT(DISTINCT rfs.customer_id) as customers_blocked_count,
+                COUNT(DISTINCT case when rd.rule = 'ml_cash_unpaid' then rd.decision_id else null end)*100/cast(count(distinct co.checkout_id) as real) as ck_block_rate
+
+        FROM "sensitive_delta"."central_risk_engine_odp"."risk_feature_snapshots_enhanced" rfs 
+
+        LEFT JOIN "sensitive_delta"."central_risk_engine_odp"."risk_decisions" rd
+                ON rd.decision_id = rfs.decision_id
+
+        LEFT JOIN  "sensitive_delta"."central_checkout_orders_odp"."checkout_orders" co 
+                ON rfs.checkout_id = co.checkout_id
+
+        WHERE  rfs.checkpoint = 'checkout' 
+                AND rfs.payment_method_type = 'CASH' 
+                AND  rfs.p_creation_date > current_date  - interval '180' day 
+                AND ml_uch_score is not null
+        GROUP BY 1,2,3
+        ORDER BY 1 DESC
+)
+
+SELECT
+    cash.creation_day,
+    cash.country, 
+    cash.customer_type,
+    count_total_orders,
+    count_cash_orders,
+    total_GMV_eur,
+    total_GTV_eur,
+    count_unpaid_cash_orders,
+    count_paid_cash_orders,
+
+    total_GMV_cash_unpaid_eur,
+    total_GTV_cash_eur,
+
+    cash_unpaid_rate,
+    total_GTV_cash_unpaid_eur,
+    count_cash_orders*100/cast(count_total_orders as real) as cash_rate,
+
+    avg_GTV_cash_unpaid_eur,
+    avg_GTV_cash_paid_eur,
+    (total_GTV_cash_unpaid_eur/cast(total_GTV_cash_eur as real))*100 as unpaid_GTV_cash_rate,
+    (total_GTV_cash_unpaid_eur/cast(total_GMV_eur as real))*100 as unpaid_total_GTV_cash_rate,
+    (total_GMV_cash_unpaid_eur/cast(total_GMV_eur as real))*100 as unpaid_total_GMV_cash_rate,
+
+    cash_customer_absence,
+    cancelled_cash_orders,
+    avg_cancelled_value_eur,
+
+    -- risk feauture snapshot metrics
+
+    avg_ml_score,
+    ml_cash_unpaid_rule_hits,
+    ml_cash_unpaid_rule_hits*100/cast(ml_cash_unpaid_rule_hits + count_cash_orders as real) as block_rate,
+    ck_block_rate,
+    customers_blocked_count,
+
+
+    -- other unpaid metrics
+
+    count_unpaid_cash_orders*100/cast(count_paid_cash_orders as real) as unpaid_rate,
+    count_paid_cash_orders/cast(count_unpaid_cash_orders as real) as unit_economics
+
+
+FROM
+    total 
+
+INNER JOIN cash ON total.creation_day = cash.creation_day
+             AND total.country = cash.country
+             AND total.customer_type = cash.customer_type
+INNER JOIN rule_triggers rt ON total.creation_day = rt.creation_day 
+            AND rt.country = total.country 
+            AND rt.customer_type = total.customer_type
+ORDER BY cash.creation_day desc
